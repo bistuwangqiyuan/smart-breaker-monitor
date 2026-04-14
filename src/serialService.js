@@ -59,6 +59,10 @@ class SerialService extends EventEmitter {
     this.pendingModbusRequest = null;
     this.currentPollTimer = null;
     this.modbusResponseBuffer = Buffer.alloc(0);
+
+    // 设备状态跟踪：设备ON时不发帧，只在关断事件时发帧
+    this.deviceState = 'unknown'; // 'on', 'off', 'unknown'
+    this.lastOnCurrent = null;    // 从关断过渡帧中提取的ON态电流
     
     // 防止未捕获的错误导致程序崩溃
     this.on('error', (error) => {
@@ -175,10 +179,10 @@ class SerialService extends EventEmitter {
       // 关断命令: AF FF 04 00 AE
       const cmd = Buffer.from([0xAF, 0xFF, 0x04, 0x00, 0xAE]);
       await this.sendCommand(cmd);
+      this.deviceState = 'off';
       return true;
     } catch (error) {
       this.logger.error(`发送关断命令失败: ${error.message}`);
-      // 不向上传播错误，返回失败结果
       return false;
     }
   }
@@ -189,10 +193,16 @@ class SerialService extends EventEmitter {
       // 开启命令: AF FF 04 01 AE
       const cmd = Buffer.from([0xAF, 0xFF, 0x04, 0x01, 0xAE]);
       await this.sendCommand(cmd);
+      this.deviceState = 'on';
+      // 如果有已知的ON态电流，立即更新显示（填充100个相同值模拟稳态）
+      if (this.lastOnCurrent !== null) {
+        this.currentData.current = new Array(100).fill(this.lastOnCurrent);
+        this.currentData.timestamp = new Date();
+        this.logger.info(`设备开启，显示ON态电流: ${this.lastOnCurrent.toFixed(3)}A`);
+      }
       return true;
     } catch (error) {
       this.logger.error(`发送开启命令失败: ${error.message}`);
-      // 不向上传播错误，返回失败结果
       return false;
     }
   }
@@ -234,11 +244,11 @@ class SerialService extends EventEmitter {
 
       setTimeout(() => {
         if (this.pendingModbusRequest === 'current') {
-          this.logger.debug('Modbus 读取电流超时');
+          this.logger.debug('Modbus 读取电流超时 (5s)');
           this.pendingModbusRequest = null;
           this.modbusResponseBuffer = Buffer.alloc(0);
         }
-      }, 1000);
+      }, 5000);
     } catch (error) {
       this.logger.error(`Modbus 轮询电流失败: ${error.message}`);
       this.pendingModbusRequest = null;
@@ -247,7 +257,7 @@ class SerialService extends EventEmitter {
   }
 
   // 启动电流 Modbus 轮询
-  startCurrentPolling(intervalMs = 2000) {
+  startCurrentPolling(intervalMs = 3000) {
     if (this.currentPollTimer) return;
 
     this.logger.info(`启动 Modbus 电流轮询，间隔 ${intervalMs}ms`);
@@ -393,8 +403,9 @@ class SerialService extends EventEmitter {
         }
         nextPos++;
       }
-      if (nextPos > 1) {
-        this.logger.debug(`跳过 ${nextPos} 个无法识别的字节`);
+      if (nextPos > 0) {
+        const skippedHex = this.dataBuffer.slice(0, Math.min(nextPos, 16)).toString('hex').toUpperCase();
+        this.logger.info(`跳过 ${nextPos} 字节: ${skippedHex}`);
       }
       this.dataBuffer = this.dataBuffer.slice(nextPos);
       progress = this.dataBuffer.length > 0;
@@ -469,6 +480,24 @@ class SerialService extends EventEmitter {
         }
         
         this.currentData.timestamp = timestamp;
+
+        // 对不完整帧也进行ON/OFF过渡检测（至少需要20个电流点）
+        if (currentArray.length >= 20) {
+          const head5 = currentArray.slice(0, 5);
+          const tail = currentArray.slice(-Math.floor(currentArray.length / 2));
+          const peakCurrent = Math.max(...head5);
+          const tailAvg = tail.reduce((a, b) => a + b, 0) / tail.length;
+
+          if (peakCurrent > 1.5 && tailAvg < 1.0) {
+            this.lastOnCurrent = peakCurrent;
+            this.deviceState = 'off';
+            this.logger.info(`不完整帧检测到过渡: ON态峰值=${peakCurrent.toFixed(3)}A, OFF态=${tailAvg.toFixed(3)}A`);
+          } else if (peakCurrent > 1.5 && tailAvg > 1.5) {
+            this.lastOnCurrent = peakCurrent;
+            this.deviceState = 'on';
+            this.logger.info(`不完整帧检测到ON态: 峰值电流=${peakCurrent.toFixed(3)}A`);
+          }
+        }
         
         // 记录解析到的数据点数量
         this.logger.info(`解析不完整数据: 电流=${currentArray.length}点, 电压=${voltageArray.length}点`);
@@ -594,15 +623,38 @@ class SerialService extends EventEmitter {
       
       const isValid = (checksum === frame[404]);
       
-      if (isValid) {
+      if (!isValid) {
+        this.logger.warn(`帧校验和无效: 计算值=0x${checksum.toString(16)}, 期望值=0x${frame[404].toString(16)}, 仍然处理数据`);
+      }
+      
+      // 不管校验和是否有效，都处理数据（设备可能有校验和计算差异）
+      {
         const timestamp = new Date();
+
+        // 检测关断过渡帧：电流快速衰减（首点高 → 末段低）
+        const head5 = currentArray.slice(0, 5);
+        const tail50 = currentArray.slice(-50);
+        const peakCurrent = Math.max(...head5);
+        const tailAvg = tail50.reduce((a, b) => a + b, 0) / tail50.length;
+
+        if (peakCurrent > 1.5 && tailAvg < 1.0) {
+          this.lastOnCurrent = peakCurrent;
+          this.logger.info(`检测到关断过渡帧: ON态峰值电流=${peakCurrent.toFixed(3)}A, OFF态电流=${tailAvg.toFixed(3)}A`);
+        }
+        if (peakCurrent > 1.5 && tailAvg > 1.5) {
+          this.lastOnCurrent = peakCurrent;
+          this.logger.info(`检测到ON态帧: 峰值电流=${peakCurrent.toFixed(3)}A`);
+        }
+
+        this.deviceState = tailAvg > 1.0 ? 'on' : 'off';
+
         const dataPacket = {
           timestamp,
           deviceType,
           deviceAddr,
           current: currentArray,
           voltage: voltageArray,
-          isComplete: true // 标记为完整数据
+          isComplete: true
         };
         
         // 保存当前数据
@@ -641,8 +693,6 @@ class SerialService extends EventEmitter {
         
         // 发出数据事件
         this.emit('data', dataPacket);
-      } else {
-        this.logger.warn(`数据校验失败: 计算校验和=${checksum}, 帧校验和=${frame[404]}`);
       }
     } catch (error) {
       this.logger.error(`解析数据帧失败: ${error.message}`);

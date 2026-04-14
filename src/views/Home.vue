@@ -220,13 +220,16 @@
         <el-card class="chart-card">
           <template #header>
             <div class="card-header">
-              <span>正常工作数据（每5秒采集）</span>
+              <span>正常工作数据（每3秒采集）</span>
               <div class="header-tags">
                 <el-tag v-if="anomalyState.status === 'warning'" type="warning" size="small" effect="dark">
                   ⚠ 可能异常（等待恢复中...）
                 </el-tag>
-                <el-tag v-if="anomalyState.status === 'fault'" type="danger" size="small" effect="dark">
-                  ✕ 异常已关断
+                <el-tag v-if="anomalyState.status === 'abnormal'" type="danger" size="small" effect="dark">
+                  ✕ 异常（30s未恢复，等待中...）
+                </el-tag>
+                <el-tag v-if="anomalyState.status === 'fault'" type="danger" size="small" effect="dark" class="fault-tag-blink">
+                  ✕ 异常关断
                 </el-tag>
                 <el-tag v-if="monitorData.timestamps.length > 0" size="small">
                   数据点: {{ monitorData.timestamps.length }}
@@ -234,6 +237,29 @@
               </div>
             </div>
           </template>
+          
+          <div class="realtime-values">
+            <div class="realtime-item current-value">
+              <span class="realtime-label">实时电流</span>
+              <span class="realtime-number" :class="{ 'anomaly-warning': anomalyState.status === 'warning', 'anomaly-danger': anomalyState.status === 'abnormal' || anomalyState.status === 'fault' }">{{ realtimeCurrent.toFixed(3) }}</span>
+              <span class="realtime-unit">A</span>
+            </div>
+            <div class="realtime-item voltage-value">
+              <span class="realtime-label">实时电压</span>
+              <span class="realtime-number">{{ realtimeVoltage.toFixed(3) }}</span>
+              <span class="realtime-unit">V</span>
+            </div>
+            <div class="realtime-item power-value">
+              <span class="realtime-label">实时功率</span>
+              <span class="realtime-number">{{ (realtimeCurrent * realtimeVoltage).toFixed(3) }}</span>
+              <span class="realtime-unit">W</span>
+            </div>
+            <div class="realtime-item baseline-value" v-if="anomalyState.baselineCurrent > 0">
+              <span class="realtime-label">基线电流</span>
+              <span class="realtime-number baseline">{{ anomalyState.baselineCurrent.toFixed(3) }}</span>
+              <span class="realtime-unit">A</span>
+            </div>
+          </div>
           
           <div class="chart-container">
             <div v-if="monitorData.timestamps.length === 0" class="no-data-overlay">
@@ -331,14 +357,22 @@ export default {
     const monitorData = ref({ timestamps: [], current: [], voltage: [], power: [] });
     const monitorPollTimer = ref(null);
     
+    // 实时显示值
+    const realtimeCurrent = ref(0);
+    const realtimeVoltage = ref(0);
+    
     // 异常检测相关
+    // 状态流: normal → warning(可能异常) → abnormal(异常) → fault(异常关断+关设备)
     const anomalyState = ref({
-      status: 'normal',        // 'normal' | 'warning' | 'fault'
+      status: 'normal',        // 'normal' | 'warning' | 'abnormal' | 'fault'
       warningIndex: -1,        // "可能异常"触发时的数据点索引
       warningTime: null,       // "可能异常"触发时间
-      baselinePower: 0,        // 异常前的基线功率
-      faultIndex: -1,          // "异常"确认时的数据点索引
+      abnormalIndex: -1,       // "异常"确认时的数据点索引
+      abnormalTime: null,      // "异常"触发时间
+      baselineCurrent: 0,      // 基线电流值（正常工作时的电流）
+      faultIndex: -1,          // "异常关断"时的数据点索引
       markPoints: [],          // 标记点列表（用于图表显示）
+      baselineBuffer: [],      // 用于计算基线的历史电流缓冲区
     });
     const exportsList = ref([]);
     const customFileName = ref(''); // 新增：自定义文件名
@@ -794,28 +828,37 @@ export default {
       
       // 构建异常标记点
       const warningPoints = anomalyState.value.markPoints
-        .filter(p => p.type === 'warning' && p.index < monitorData.value.power.length)
+        .filter(p => p.type === 'warning' && p.index < monitorData.value.current.length)
         .map(p => ({
-          coord: [p.index, monitorData.value.power[p.index]],
+          coord: [p.index, monitorData.value.current[p.index]],
           symbol: 'triangle',
           symbolSize: 14,
           itemStyle: { color: '#E6A23C' },
           label: { show: true, formatter: '可能异常', color: '#E6A23C', fontWeight: 'bold', position: 'top', fontSize: 12 }
         }));
       
-      const faultPoints = anomalyState.value.markPoints
-        .filter(p => p.type === 'fault' && p.index < monitorData.value.power.length)
+      const abnormalPoints = anomalyState.value.markPoints
+        .filter(p => p.type === 'abnormal' && p.index < monitorData.value.current.length)
         .map(p => ({
-          coord: [p.index, monitorData.value.power[p.index]],
-          symbol: 'pin',
-          symbolSize: 18,
+          coord: [p.index, monitorData.value.current[p.index]],
+          symbol: 'diamond',
+          symbolSize: 16,
           itemStyle: { color: '#F56C6C' },
-          label: { show: true, formatter: '异常关断', color: '#F56C6C', fontWeight: 'bold', position: 'top', fontSize: 12 }
+          label: { show: true, formatter: '异常', color: '#F56C6C', fontWeight: 'bold', position: 'top', fontSize: 12 }
         }));
       
-      const powerMarkPoint = (warningPoints.length > 0 || faultPoints.length > 0) ? {
-        data: [...warningPoints, ...faultPoints]
-      } : undefined;
+      const faultPoints = anomalyState.value.markPoints
+        .filter(p => p.type === 'fault' && p.index < monitorData.value.current.length)
+        .map(p => ({
+          coord: [p.index, monitorData.value.current[p.index]],
+          symbol: 'pin',
+          symbolSize: 18,
+          itemStyle: { color: '#FF0000' },
+          label: { show: true, formatter: '异常关断', color: '#FF0000', fontWeight: 'bold', position: 'top', fontSize: 12 }
+        }));
+      
+      const allMarkPoints = [...warningPoints, ...abnormalPoints, ...faultPoints];
+      const currentMarkPoint = allMarkPoints.length > 0 ? { data: allMarkPoints } : undefined;
       
       const option = {
         title: {
@@ -886,7 +929,8 @@ export default {
             type: 'line',
             smooth: true,
             data: monitorData.value.current,
-            itemStyle: { color: '#5470C6' }
+            itemStyle: { color: '#5470C6' },
+            markPoint: currentMarkPoint
           },
           {
             name: '电压 (V)',
@@ -903,8 +947,7 @@ export default {
             yAxisIndex: 2,
             data: monitorData.value.power,
             itemStyle: { color: '#EE6666' },
-            lineStyle: { width: 2, type: 'solid' },
-            markPoint: powerMarkPoint
+            lineStyle: { width: 2, type: 'solid' }
           }
         ]
       };
@@ -912,7 +955,7 @@ export default {
       monitorChartInstance.value.setOption(option, true);
     };
     
-    // 从真实串口数据中采样一个监测点（由handleSerialData调用）
+    // 从真实串口数据中采样一个监测点
     const addMonitorSample = (sampleCurrent, sampleVoltage) => {
       const now = new Date();
       const timeLabel = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
@@ -926,59 +969,109 @@ export default {
       
       const idx = monitorData.value.power.length - 1;
       
-      // --- 异常检测逻辑 ---
-      const SAMPLE_INTERVAL = 5;    // 5秒采集间隔
-      const SLOPE_THRESHOLD = 1;    // 1 W/s
-      const RECOVERY_TIMEOUT = 30000; // 30秒（毫秒）
-      const RECOVERY_RATIO = 0.8;   // 恢复到基线的80%
+      // --- 电流异常检测逻辑 ---
+      const CURRENT_DROP_RATIO = 0.8;  // 降至80%触发可能异常
+      const WARNING_TIMEOUT = 30000;    // 30秒未恢复 → 异常
+      const ABNORMAL_TIMEOUT = 30000;   // 再30秒未恢复 → 异常关断
+      const BASELINE_BUFFER_SIZE = 10;  // 用最近10个稳定读数算基线
+      const MIN_CURRENT_THRESHOLD = 0.1; // 低于此值不参与异常检测（设备关闭态）
       
-      if (monitorData.value.power.length >= 2) {
-        const prevPower = monitorData.value.power[idx - 1];
-        const powerSlope = Math.abs(curPower - prevPower) / SAMPLE_INTERVAL;
+      const state = anomalyState.value;
+      
+      if (state.status === 'normal') {
+        // 在正常状态下，维护基线电流缓冲区
+        if (sampleCurrent > MIN_CURRENT_THRESHOLD) {
+          state.baselineBuffer.push(sampleCurrent);
+          if (state.baselineBuffer.length > BASELINE_BUFFER_SIZE) {
+            state.baselineBuffer.shift();
+          }
+          // 当缓冲区满时计算基线
+          if (state.baselineBuffer.length >= 3) {
+            state.baselineCurrent = state.baselineBuffer.reduce((a, b) => a + b, 0) / state.baselineBuffer.length;
+          }
+        }
         
-        if (anomalyState.value.status === 'normal') {
-          if (powerSlope > SLOPE_THRESHOLD) {
-            anomalyState.value.status = 'warning';
-            anomalyState.value.warningIndex = idx;
-            anomalyState.value.warningTime = now;
-            anomalyState.value.baselinePower = prevPower;
-            anomalyState.value.markPoints.push({
+        // 检测电流是否降至基线的80%
+        if (state.baselineCurrent > MIN_CURRENT_THRESHOLD && sampleCurrent > MIN_CURRENT_THRESHOLD) {
+          const threshold = state.baselineCurrent * CURRENT_DROP_RATIO;
+          if (sampleCurrent < threshold) {
+            state.status = 'warning';
+            state.warningIndex = idx;
+            state.warningTime = now;
+            state.markPoints.push({
               index: idx,
               type: 'warning',
-              label: `可能异常 (${powerSlope.toFixed(2)} W/s)`
+              label: `可能异常 (${sampleCurrent.toFixed(3)}A < ${threshold.toFixed(3)}A)`
             });
-            ElMessage.warning(`功率变化率 ${powerSlope.toFixed(2)} W/s 超过阈值 1 W/s，可能异常！`);
+            ElMessage.warning(`电流降至基线的${Math.round(sampleCurrent / state.baselineCurrent * 100)}%（${sampleCurrent.toFixed(3)}A / 基线${state.baselineCurrent.toFixed(3)}A），可能异常！`);
           }
-        } else if (anomalyState.value.status === 'warning') {
-          const baseline = anomalyState.value.baselinePower;
-          const recoveryTarget = baseline * RECOVERY_RATIO;
-          const elapsed = now.getTime() - anomalyState.value.warningTime.getTime();
+        }
+      } else if (state.status === 'warning') {
+        // "可能异常"状态：检查是否恢复或超时
+        const threshold = state.baselineCurrent * CURRENT_DROP_RATIO;
+        const elapsed = now.getTime() - state.warningTime.getTime();
+        
+        if (sampleCurrent >= threshold || sampleCurrent <= MIN_CURRENT_THRESHOLD) {
+          // 电流恢复到80%以上，或设备关闭（电流极低），恢复正常
+          state.status = 'normal';
+          state.warningIndex = -1;
+          state.warningTime = null;
+          if (sampleCurrent >= threshold) {
+            ElMessage.success('电流已恢复正常');
+          }
+        } else if (elapsed >= WARNING_TIMEOUT) {
+          // 30秒未恢复 → 升级为"异常"
+          state.status = 'abnormal';
+          state.abnormalIndex = idx;
+          state.abnormalTime = now;
+          state.markPoints.push({
+            index: idx,
+            type: 'abnormal',
+            label: `异常 (30s未恢复)`
+          });
+          ElMessage.error('电流持续30秒未恢复，标记为异常！');
+        }
+      } else if (state.status === 'abnormal') {
+        // "异常"状态：检查是否恢复或再超时30s
+        const threshold = state.baselineCurrent * CURRENT_DROP_RATIO;
+        const elapsed = now.getTime() - state.abnormalTime.getTime();
+        
+        if (sampleCurrent >= threshold || sampleCurrent <= MIN_CURRENT_THRESHOLD) {
+          state.status = 'normal';
+          state.warningIndex = -1;
+          state.warningTime = null;
+          state.abnormalIndex = -1;
+          state.abnormalTime = null;
+          if (sampleCurrent >= threshold) {
+            ElMessage.success('电流已恢复正常');
+          }
+        } else if (elapsed >= ABNORMAL_TIMEOUT) {
+          // 再过30秒未恢复 → "异常关断"并关断设备
+          state.status = 'fault';
+          state.faultIndex = idx;
+          state.markPoints.push({
+            index: idx,
+            type: 'fault',
+            label: `异常关断 (60s未恢复)`
+          });
+          ElMessage.error('电流持续60秒未恢复，异常关断设备！');
           
-          if (baseline > 0 && curPower >= recoveryTarget) {
-            anomalyState.value.status = 'normal';
-            anomalyState.value.warningIndex = -1;
-            anomalyState.value.warningTime = null;
-            ElMessage.success('功率已恢复正常');
-          } else if (elapsed >= RECOVERY_TIMEOUT) {
-            anomalyState.value.status = 'fault';
-            anomalyState.value.faultIndex = idx;
-            anomalyState.value.markPoints.push({
-              index: idx,
-              type: 'fault',
-              label: `异常关断 (30s未恢复)`
-            });
-            ElMessage.error('30秒内未恢复至正常功率的80%，确认异常，正在关断设备...');
-            
-            apiService.sendShutdownCommand().then(() => {
-              ElMessage.warning('已发送关断命令');
-            }).catch((err) => {
-              ElMessage.error('关断命令发送失败: ' + (err.message || ''));
-            });
-            
-            anomalyState.value.status = 'normal';
-            anomalyState.value.warningIndex = -1;
-            anomalyState.value.warningTime = null;
-          }
+          apiService.sendShutdownCommand().then(() => {
+            ElMessage.warning('已发送关断命令');
+          }).catch((err) => {
+            ElMessage.error('关断命令发送失败: ' + (err.message || ''));
+          });
+          
+          // 关断后重置状态，允许重新建立基线
+          setTimeout(() => {
+            state.status = 'normal';
+            state.warningIndex = -1;
+            state.warningTime = null;
+            state.abnormalIndex = -1;
+            state.abnormalTime = null;
+            state.baselineBuffer = [];
+            state.baselineCurrent = 0;
+          }, 5000);
         }
       }
       
@@ -1012,7 +1105,7 @@ export default {
       return d.toLocaleString();
     };
     
-    // 每5秒主动轮询后端获取最新数据，更新正常工作数据图表
+    // 每3秒主动轮询后端获取最新数据，更新正常工作数据图表
     const startMonitorPolling = () => {
       if (monitorPollTimer.value) return;
       monitorPollTimer.value = setInterval(async () => {
@@ -1021,27 +1114,29 @@ export default {
           const currArr = data.current || [];
           const voltArr = data.voltage || [];
           
-          if (currArr.length > 0 || voltArr.length > 0) {
-            const sampleCurrent = currArr.length > 0
-              ? Math.round((currArr.reduce((a, b) => a + b, 0) / currArr.length) * 1000) / 1000
-              : 0;
-            const sampleVoltage = voltArr.length > 0
-              ? Math.round((voltArr.reduce((a, b) => a + b, 0) / voltArr.length) * 1000) / 1000
-              : 0;
-            
-            if (!monitorChartInstance.value) {
-              nextTick(() => {
-                initMonitorChart();
-                addMonitorSample(sampleCurrent, sampleVoltage);
-              });
-            } else {
+          const sampleCurrent = currArr.length > 0
+            ? Math.round((currArr.reduce((a, b) => a + b, 0) / currArr.length) * 1000) / 1000
+            : 0;
+          const sampleVoltage = voltArr.length > 0
+            ? Math.round((voltArr.reduce((a, b) => a + b, 0) / voltArr.length) * 1000) / 1000
+            : 0;
+          
+          // 更新实时显示值
+          realtimeCurrent.value = sampleCurrent;
+          realtimeVoltage.value = sampleVoltage;
+          
+          if (!monitorChartInstance.value) {
+            nextTick(() => {
+              initMonitorChart();
               addMonitorSample(sampleCurrent, sampleVoltage);
-            }
+            });
+          } else {
+            addMonitorSample(sampleCurrent, sampleVoltage);
           }
         } catch (error) {
           // 后端未连接时静默忽略
         }
-      }, 5000);
+      }, 3000);
     };
     
     const stopMonitorPolling = () => {
@@ -1194,6 +1289,8 @@ export default {
       monitorChartRef,
       monitorData,
       anomalyState,
+      realtimeCurrent,
+      realtimeVoltage,
       currentData,
       lastUpdateTime,
       exportsList,
@@ -1288,6 +1385,73 @@ export default {
   float: right;
   color: #999;
   font-size: 13px;
+}
+
+/* 实时数值显示 */
+.realtime-values {
+  display: flex;
+  gap: 16px;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #f5f7fa, #e8ecf1);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.realtime-item {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px 12px;
+  background: white;
+  border-radius: 6px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+.realtime-label {
+  font-size: 13px;
+  color: #909399;
+  white-space: nowrap;
+}
+
+.realtime-number {
+  font-size: 24px;
+  font-weight: 700;
+  font-family: 'Roboto', monospace;
+  color: #303133;
+  transition: color 0.3s;
+}
+
+.realtime-number.anomaly-warning {
+  color: #E6A23C;
+}
+
+.realtime-number.anomaly-danger {
+  color: #F56C6C;
+}
+
+.realtime-number.baseline {
+  font-size: 18px;
+  color: #67C23A;
+}
+
+.realtime-unit {
+  font-size: 14px;
+  color: #606266;
+}
+
+.current-value { border-left: 3px solid #5470C6; }
+.voltage-value { border-left: 3px solid #91CC75; }
+.power-value { border-left: 3px solid #EE6666; }
+.baseline-value { border-left: 3px solid #67C23A; }
+
+.fault-tag-blink {
+  animation: blink-red 0.8s ease-in-out infinite;
+}
+
+@keyframes blink-red {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 .chart-container {
